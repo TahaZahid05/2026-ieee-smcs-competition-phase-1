@@ -32,7 +32,7 @@ ROBOT_RADIUS = 0.25   # metres — used to inflate obstacles so robot doesn't cl
 
 
 class PathPlanner:
-    """A* planner operating on a pre-built binary occupancy grid."""
+    """A* planner operating on a pre-built binary occupancy grid with clearance cost."""
 
     def __init__(self, map_png_path: str, metadata_path: str):
         """
@@ -63,11 +63,11 @@ class PathPlanner:
         self._raw_grid = arr < 128    # True = occupied
 
         # ── Inflate obstacles by robot radius ────────────────────────────
-        inflation_px = int(math.ceil(ROBOT_RADIUS / self._res))
-        self._grid = self._inflate(self._raw_grid, inflation_px)
+        self._inflation_px = int(math.ceil(ROBOT_RADIUS / self._res))
+        self._grid = self._inflate(self._raw_grid, self._inflation_px)
 
         print(f"[PathPlanner] Map: {self._width}×{self._height}px, "
-              f"res={self._res}m/px, inflation={inflation_px}px")
+              f"res={self._res}m/px, inflation={self._inflation_px}px")
         print(f"[PathPlanner] World bounds: "
               f"x=[{self._world_min_x:.2f}, {self._world_min_x + self._width*self._res:.2f}] "
               f"y=[{self._world_max_y - self._height*self._res:.2f}, {self._world_max_y:.2f}]")
