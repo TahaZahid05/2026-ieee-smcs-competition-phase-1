@@ -6,10 +6,13 @@ from controller import Robot
 import json
 import math
 import os
+from dotenv import load_dotenv
+load_dotenv()
 from odometry import Odometry
 from path_planner import PathPlanner
 from navigator import Navigator
 from live_map import LiveMap
+from central_commander_llm import CentralCommanderLLM
 
 class BasicRosbotController:
     def __init__(self):
@@ -23,8 +26,8 @@ class BasicRosbotController:
         # Initialize sensors and actuators
         self._init_devices()
 
-        # Navigation constants
-        self.max_speed = 5.0
+        # Navigation constants (aligned with Rosbot motor limits and Navigator.py)
+        self.max_speed = 25.0
 
         # Load known victim candidate locations
         self.all_victims = self._load_victims()
@@ -33,10 +36,35 @@ class BasicRosbotController:
 
         if self.robot_id == "robot1":
             start_x, start_y = -0.375, 0.375
-            initial_target = (2.12, 5.71)   # Victim 3 (Dining Room)
         else:
             start_x, start_y = -0.375, 0.0
-            initial_target = (3.99, -3.94)  # Victim 2 (Bedroom open floor)
+
+        # Query Central Commander LLM for mission target allocations
+        commander = CentralCommanderLLM(
+            "sim_logs/map_estimate.png",
+            "sim_logs/map_metadata.json"
+        )
+        robots_info = [
+            {"id": "robot1", "coord": (-0.375, 0.375)},
+            {"id": "robot2", "coord": (-0.375, 0.000)},
+        ]
+        victims_info = [
+            {"id": f"victim{i+1}", "coord": v} for i, v in enumerate(self.all_victims)
+        ]
+
+        if self.robot_id == "robot1":
+            llm_assignments = commander.allocate_targets(robots_info, victims_info)
+        else:
+            llm_assignments = commander.wait_for_plan(timeout=15.0)
+
+        assigned_route = llm_assignments.get(self.robot_id, [])
+
+        if assigned_route:
+            initial_target = assigned_route[0]
+            remaining = [v for v in self.all_victims if v not in assigned_route]
+            self.all_victims = assigned_route + remaining
+        else:
+            initial_target = (2.12, 5.71) if self.robot_id == "robot1" else (3.99, -3.94)
 
         self._target_x, self._target_y = initial_target
         self._current_target = initial_target
@@ -114,32 +142,24 @@ class BasicRosbotController:
                 self.visited_victims.add(v)
 
     def _get_next_target(self) -> tuple[float, float] | None:
-        """Find the closest unvisited and unclaimed victim to the robot's current position."""
-        best_target = None
-        min_dist = float("inf")
+        """Find the next unvisited and unclaimed victim in LLM-prioritized order."""
         claimed_coords = list(self.claimed_by_peer.values())
 
+        # First pass: pick the first unvisited victim in LLM priority order not claimed by peer
         for vx, vy in self.all_victims:
             if self._is_victim_visited((vx, vy)):
                 continue
             # Skip if peer is actively pursuing this victim
             if any(math.hypot(vx - cx, vy - cy) < 0.8 for cx, cy in claimed_coords):
                 continue
-            d = self.odom.distance_to(vx, vy)
-            if d < min_dist:
-                min_dist = d
-                best_target = (vx, vy)
+            return (vx, vy)
 
-        # Fallback: if all remaining unvisited are claimed, pick closest unvisited
-        if best_target is None:
-            for vx, vy in self.all_victims:
-                if not self._is_victim_visited((vx, vy)):
-                    d = self.odom.distance_to(vx, vy)
-                    if d < min_dist:
-                        min_dist = d
-                        best_target = (vx, vy)
+        # Fallback: if all remaining unvisited are claimed, pick first unvisited
+        for vx, vy in self.all_victims:
+            if not self._is_victim_visited((vx, vy)):
+                return (vx, vy)
 
-        return best_target
+        return None
 
     def _assign_next_target(self) -> bool:
         """Select, broadcast, and route to the next available victim."""
@@ -148,7 +168,7 @@ class BasicRosbotController:
             self._target_x, self._target_y = next_target
             self._current_target = next_target
             self._broadcast_pursuing(next_target)
-            live_grid = self.live_map.get_inflated_grid(inflation_px=5)
+            live_grid = self.live_map.get_inflated_grid()
             wps = self.planner.replan_on_grid(
                 live_grid,
                 self.odom.x,
@@ -280,6 +300,7 @@ class BasicRosbotController:
         try:
             self.lidar = self.robot.getDevice("laser")
             self.lidar.enable(self.timestep)
+            self.lidar.enablePointCloud()
         except:
             self.lidar = None
             print(f"[{self.robot_id}] Warning: No lidar found")
@@ -385,39 +406,85 @@ class BasicRosbotController:
         # 2. Update live map with current Lidar hits
         self.live_map.update(self.odom.x, self.odom.y, self.odom.heading, self.lidar)
 
-        # 3. Handle arrival at current victim target
-        if self.navigator.is_arrived:
-            if self._current_target is not None:
-                dist_to_target = self.odom.distance_to(self._target_x, self._target_y)
-                if dist_to_target < 0.6:
-                    print(f"[{self.robot_id}] Reached target ({self._target_x:.2f}, {self._target_y:.2f}) (dist={dist_to_target:.2f}m)! Reporting to supervisor...")
-                    self.send_victim_found_message(True, 1.0)
-                    self._broadcast_victim_found(self._current_target)
-                    self._mark_victim_visited(self._current_target)
-                    self._assign_next_target()
-            return
+        # 3. Handle arrival at current victim target (safe standoff < 0.75m, supervisor window is 1.0m)
+        if self._current_target is not None:
+            dist_to_target = self.odom.distance_to(self._target_x, self._target_y)
+            if dist_to_target < 0.75 or self.navigator.is_arrived:
+                print(f"[{self.robot_id}] In range of target ({self._target_x:.2f}, {self._target_y:.2f}) (dist={dist_to_target:.2f}m)! Reporting to supervisor...")
+                self.send_victim_found_message(True, 1.0)
+                self._broadcast_victim_found(self._current_target)
+                self._mark_victim_visited(self._current_target)
+                self._assign_next_target()
+                return
 
-        # 4. Periodic A* replan on the live map (every 3 seconds)
-        if (
-            self._current_target is not None
-            and current_time - self._last_replan_time >= self._replan_interval
-        ):
-            live_grid = self.live_map.get_inflated_grid(inflation_px=5)
-            new_wps = self.planner.replan_on_grid(
-                live_grid,
-                self.odom.x,
-                self.odom.y,
-                self._target_x,
-                self._target_y,
-            )
-            if new_wps:
-                self.navigator.set_waypoints(new_wps)
-            self._last_replan_time = current_time
+        # 4. Immediate Replan on Path Blockage OR Periodic Replan
+        if self._current_target is not None:
+            if not hasattr(self, '_replan_backoff_until'):
+                self._replan_backoff_until = 0.0
+
+            # If in backoff state after a "no path found", keep motors stopped and wait
+            if current_time < self._replan_backoff_until:
+                self.set_wheel_speeds(0.0, 0.0)
+                return
+
+            live_grid = self.live_map.get_inflated_grid()
+            path_blocked = False
+            if self.navigator.waypoints and len(self.navigator.waypoints) > 0:
+                path_blocked = self.planner.is_path_blocked(
+                    live_grid,
+                    self.odom.x,
+                    self.odom.y,
+                    self.navigator.waypoints,
+                    check_segments=2
+                )
+
+            # Replan if path is blocked (with min 0.4s cooldown) or periodically every replan_interval
+            time_since_replan = current_time - self._last_replan_time
+            should_replan = (path_blocked and time_since_replan >= 0.4) or (time_since_replan >= self._replan_interval)
+
+            if should_replan:
+                new_wps = self.planner.replan_on_grid(
+                    live_grid,
+                    self.odom.x,
+                    self.odom.y,
+                    self._target_x,
+                    self._target_y,
+                )
+                self._last_replan_time = current_time
+
+                if new_wps:
+                    self.navigator.set_waypoints(new_wps)
+                    if path_blocked:
+                        print(f"[{self.robot_id}] ⚡ Dynamic obstacle detected in path! Replanned {len(new_wps)} waypoints immediately.")
+                        debug_path = f"sim_logs/live_map_debug_{self.robot_id}.png"
+                        self.live_map.save_debug_image(
+                            debug_path,
+                            self.odom.x,
+                            self.odom.y,
+                            self.odom.heading,
+                            new_wps,
+                            (self._target_x, self._target_y)
+                        )
+                else:
+                    # No path found: STOP MOTORS, save debug map to visualize blockage, and back off 0.6s
+                    print(f"[{self.robot_id}] 🛑 No path found to target ({self._target_x:.2f}, {self._target_y:.2f}). Stopping motors and yielding 0.6s...")
+                    self.set_wheel_speeds(0.0, 0.0)
+                    self._replan_backoff_until = current_time + 0.6
+                    debug_path = f"sim_logs/live_map_debug_{self.robot_id}.png"
+                    self.live_map.save_debug_image(
+                        debug_path,
+                        self.odom.x,
+                        self.odom.y,
+                        self.odom.heading,
+                        self.navigator.waypoints,
+                        (self._target_x, self._target_y)
+                    )
+                    return
 
         # 5. Pure waypoint tracking
         status = self.navigator.step()
 
-        # 6. Periodic position + status log every 5 seconds
+        # 6. Periodic position + status log and debug snapshot every 5 seconds
         if not hasattr(self, '_last_log_time'):
             self._last_log_time = 0.0
         if current_time - self._last_log_time >= 5.0:
@@ -428,6 +495,16 @@ class BasicRosbotController:
                   f"pos=({self.odom.x:.2f},{self.odom.y:.2f}) "
                   f"hdg={math.degrees(self.odom.heading):.0f}° "
                   f"mode={status} target={tgt_str} next_wp={wp_str}")
+            # Save periodic visual snapshot
+            debug_path = f"sim_logs/live_map_debug_{self.robot_id}.png"
+            self.live_map.save_debug_image(
+                debug_path,
+                self.odom.x,
+                self.odom.y,
+                self.odom.heading,
+                self.navigator.waypoints,
+                (self._target_x, self._target_y)
+            )
             self._last_log_time = current_time
 
     def run(self):
@@ -436,11 +513,6 @@ class BasicRosbotController:
 
         while self.robot.step(self.timestep) != -1:
             self.odom.update()
-
-            # Stagger start: robot1 waits 8s for robot2 to clear the shared corridor
-            if self.robot_id == "robot1" and self.robot.getTime() < 8.0:
-                continue
-
             self.set_explore_behavior()
 
 

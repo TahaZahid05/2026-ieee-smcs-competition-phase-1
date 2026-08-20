@@ -122,8 +122,8 @@ class PathPlanner:
         live_grid: np.ndarray,
         start_x: float, start_y: float,
         goal_x:  float, goal_y:  float,
-        goal_clearance_px: int = 10,
-        start_clearance_px: int = 4,
+        goal_clearance_px: int = 15,
+        start_clearance_px: int = 5,
     ) -> list[tuple[float, float]] | None:
         """
         Replan path using an external/live occupancy grid (e.g. from LiveMap).
@@ -160,6 +160,67 @@ class PathPlanner:
             return self.plan(start_x, start_y, goal_x, goal_y)
         finally:
             self._grid = saved_grid
+
+    def is_path_blocked(
+        self,
+        live_grid: np.ndarray,
+        start_x: float, start_y: float,
+        waypoints: list[tuple[float, float]],
+        check_segments: int = 2,
+    ) -> bool:
+        """
+        Check if the path from (start_x, start_y) through upcoming waypoints
+        intersects any occupied cell on the live grid.
+
+        Args:
+            live_grid       : Inflated combined occupancy grid.
+            start_x, start_y: Current robot position (origin-relative).
+            waypoints       : Active list of waypoints ahead.
+            check_segments  : Number of waypoint segments ahead to verify.
+
+        Returns:
+            True if an obstacle intersects the path ahead, False otherwise.
+        """
+        if not waypoints:
+            return False
+
+        points_to_check = [(start_x, start_y)] + list(waypoints[:check_segments])
+
+        for i in range(len(points_to_check) - 1):
+            p0 = points_to_check[i]
+            p1 = points_to_check[i + 1]
+
+            r0, c0 = self._world_to_pixel(p0[0], p0[1])
+            r1, c1 = self._world_to_pixel(p1[0], p1[1])
+
+            dr = abs(r1 - r0)
+            dc = abs(c1 - c0)
+            sr = 1 if r1 > r0 else -1
+            sc = 1 if c1 > c0 else -1
+            err = dr - dc
+
+            curr_r, curr_c = r0, c0
+            step_count = 0
+            while True:
+                # Skip first 3 pixels if starting from robot pos to avoid self-inflation
+                if i > 0 or step_count > 3:
+                    if 0 <= curr_r < self._height and 0 <= curr_c < self._width:
+                        if live_grid[curr_r, curr_c]:
+                            return True
+
+                if curr_r == r1 and curr_c == c1:
+                    break
+
+                e2 = 2 * err
+                if e2 > -dc:
+                    err -= dc
+                    curr_r += sr
+                if e2 < dr:
+                    err += dr
+                    curr_c += sc
+                step_count += 1
+
+        return False
 
     # ── Coordinate transforms ────────────────────────────────────────────────
 

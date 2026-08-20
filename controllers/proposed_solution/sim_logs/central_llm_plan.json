@@ -1,0 +1,25 @@
+{
+  "reasoning": "Victims are spatially clustered into a northern group (C, D) and a southern group (A, B). Assigning robot1 to cover the northern sector (C then D) and robot2 to cover the southern sector (B then A) optimizes path lengths, prevents corridor congestion, and minimizes the overall mission makespan to ~20.3 metres.",
+  "assignments": {
+    "robot1": [
+      [
+        2.12,
+        5.71
+      ],
+      [
+        8.67,
+        6.54
+      ]
+    ],
+    "robot2": [
+      [
+        3.99,
+        -3.94
+      ],
+      [
+        2.71,
+        -3.22
+      ]
+    ]
+  }
+}

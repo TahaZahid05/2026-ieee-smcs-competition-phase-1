@@ -9,9 +9,9 @@ globally via live occupancy grid mapping and A* replanning.
 import math
 
 
-BASE_SPEED   = 3.0    # rad/s — forward speed when well aligned with waypoint
-MAX_SPEED    = 9.0    # rad/s — motor velocity cap
-TURN_GAIN    = 4.0    # proportional gain for heading correction
+BASE_SPEED   = 15.0    # rad/s — forward speed when well aligned with waypoint
+MAX_SPEED    = 25.0    # rad/s — motor velocity cap
+TURN_GAIN    = 8.0    # proportional gain for heading correction
 ARRIVAL_DIST = 0.30   # metres — distance threshold to pop current waypoint
 
 
@@ -104,6 +104,11 @@ class Navigator:
     @property
     def current_target(self) -> tuple[float, float] | None:
         return self._waypoints[0] if self._waypoints else None
+
+    @property
+    def waypoints(self) -> list[tuple[float, float]]:
+        """Return a copy of the current active waypoints list."""
+        return list(self._waypoints)
 
 
 # ── Helper ───────────────────────────────────────────────────────────────────
